@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block content %}
+{% if msg %}<div class="flash ok">{{ msg }}</div>{% endif %}
+{% if err %}<div class="flash bad">{{ err }}</div>{% endif %}
+{% if airflow_error %}<div class="flash bad">Airflow API: {{ airflow_error }}</div>{% endif %}
+
+<section>
+  <div class="section-head">
+    <h2>Nodes</h2>
+    <span class="muted" id="nodes-updated">waiting for the first poll…</span>
+  </div>
+  <p class="muted">Compose project <code id="nodes-project">{{ nodes.project or "?" }}</code>.
+    Data node cap from <code>.env</code>: <strong>{{ config.data_node_mem_limit or "not set" }}</strong>.
+    Memory is live cgroup usage minus reclaimable file cache, like <code>docker stats</code>.</p>
+  <table class="grid" id="nodes">
+    <thead><tr><th>Service</th><th>Container</th><th>State</th><th>CPU</th><th>Memory</th><th>Cap</th><th>CPUs</th><th>Restarts</th></tr></thead>
+    <tbody><tr><td colspan="8" class="muted">loading…</td></tr></tbody>
+  </table>
+  <div id="airflow-health" class="badges">
+    {% if health %}
+      {% for comp in ["metadatabase", "scheduler", "triggerer", "dag_processor"] %}
+        {% set st = (health.get(comp) or {}).get("status") %}
+        <span class="badge {{ 'good' if st == 'healthy' else 'critical' }}">{{ comp }}: {{ st or "n/a" }}</span>
+      {% endfor %}
+    {% else %}
+      <span class="badge critical">Airflow health unavailable</span>
+    {% endif %}
+  </div>
+</section>
+
+<section>
+  <div class="section-head"><h2>Datasets</h2><span class="muted">under /data/datasets on the data node</span></div>
+  {% if datasets %}
+  <table class="grid">
+    <thead><tr><th>Name</th><th>Shape (T, Z, Y, X)</th><th>dtype</th><th>Size</th><th>Stimuli</th><th>Runs</th><th></th></tr></thead>
+    <tbody>
+    {% for d in datasets %}
+      <tr>
+        <td><a href="/datasets/{{ d.name }}">{{ d.name }}</a></td>
+        {% if d.error %}
+          <td colspan="5" class="bad">{{ d.error }}</td>
+        {% else %}
+          <td class="num">{{ d.shape|join(" × ") }}</td>
+          <td>{{ d.dtype }}</td>
+          <td class="num">{{ d.size_bytes|size }}</td>
+          <td>{{ "yes" if d.has_stimuli else "no" }}</td>
+          <td class="num">{{ d.n_results }}</td>
+        {% endif %}
+        <td><button type="button" class="small" onclick="prefillFactorization('{{ d.name }}')">Run factorization</button></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="muted">No datasets yet. Generate a synthetic one below, or drop a <code>.zarr</code>, <code>.npy</code> or <code>.tif</code> into <code>DATASETS_DIR</code>.</p>
+  {% endif %}
+</section>
+
+<section class="two-col">
+  {% for dag_id in dag_ids %}
+  <details class="launch" id="launch-{{ dag_id }}" {% if dag_id == "roi_factorization" %}open{% endif %}>
+    <summary><h2>{{ "Run ROI factorization" if dag_id == "roi_factorization" else "Generate synthetic movie" }}</h2></summary>
+    <form method="post" action="/launch" class="params">
+      <input type="hidden" name="dag_id" value="{{ dag_id }}">
+      {% set schema = dag_params.get(dag_id) or {} %}
+      {% if schema %}
+        {% for name, spec in schema.items() %}
+          {% set s = spec.schema or {} %}
+          {% set kind = s.type if s.type is string else (s.type or [None])[0] %}
+          <label>
+            <span class="label">{{ name }}</span>
+            {% if s.enum %}
+              <select name="{{ name }}">
+                {% for choice in s.enum %}<option value="{{ choice }}" {% if choice == spec.default %}selected{% endif %}>{{ choice }}</option>{% endfor %}
+              </select>
+            {% elif kind == "boolean" %}
+              <input type="checkbox" name="{{ name }}" {% if spec.default %}checked{% endif %}>
+            {% elif kind in ("integer", "number") %}
+              <input type="number" name="{{ name }}" value="{{ spec.default }}" {% if kind == "number" %}step="any"{% endif %} {% if s.minimum is not none %}min="{{ s.minimum }}"{% endif %}>
+            {% else %}
+              <input type="text" name="{{ name }}" value="{{ spec.default }}">
+            {% endif %}
+            {% if spec.description %}<small>{{ spec.description }}</small>{% endif %}
+          </label>
+        {% endfor %}
+      {% else %}
+        <label><span class="label">conf (JSON)</span><textarea name="conf_json" rows="6">{}</textarea>
+          <small>Airflow did not return the DAG's params (not parsed yet?). Pass conf as JSON.</small></label>
+      {% endif %}
+      <button type="submit">Trigger {{ dag_id }}</button>
+    </form>
+  </details>
+  {% endfor %}
+</section>
+
+<section>
+  <div class="section-head"><h2>Recent runs</h2><span class="muted" id="runs-updated"></span></div>
+  <table class="grid" id="runs">
+    <thead><tr><th>DAG</th><th>Run</th><th>Dataset</th><th>State</th><th>Started</th><th>Duration</th><th>Tasks</th><th></th></tr></thead>
+    <tbody>
+    {% for r in runs %}
+      <tr>
+        <td>{{ r.dag_id }}</td>
+        <td><a href="{{ r.airflow_url }}" target="_blank" rel="noopener" class="mono">{{ r.dag_run_id }}</a></td>
+        <td>{% if r.dataset %}<a href="/datasets/{{ r.dataset }}?run={{ r.result_dir }}">{{ r.dataset }}</a>{% endif %}</td>
+        <td><span class="badge state-{{ r.state }}">{{ r.state }}</span></td>
+        <td class="mono">{{ (r.start_date or "")[:19] }}</td>
+        <td class="num">{{ "%.0f s"|format(r.duration) if r.duration else "" }}</td>
+        <td class="tasks" data-dag="{{ r.dag_id }}" data-run="{{ r.dag_run_id }}"></td>
+        <td><details class="inline"><summary>conf</summary><code>{{ r.conf_json }}</code></details></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8" class="muted">no runs yet</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+  startNodePolling({{ (config.poll_seconds * 1000)|int }});
+  startRunPolling(10000);
+</script>
+{% endblock %}

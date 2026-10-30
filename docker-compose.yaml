@@ -1,0 +1,328 @@
+# Single-machine test deployment of Apache Airflow for ROI extraction from
+# volumetric neural-imaging movies.
+#
+# Derived from the official Airflow 3.3 docker-compose.yaml, with these changes:
+#   * one custom image (docker/airflow/Dockerfile) adding numpy/scipy/sklearn/zarr
+#   * `data-node`: a Celery worker that holds the datasets and runs the in-memory
+#     factorization. Its memory cap is DATA_NODE_MEM_LIMIT (see .env).
+#   * `compute-worker`: N interchangeable workers for the lighter tasks
+#     (classification, bookkeeping). They cannot see the raw datasets.
+#   * `dashboard`: node monitor + data browser + launcher (port 8090).
+#
+# Every tunable is read from .env (create it with `make env`; see .env.example).
+
+x-airflow-common:
+  &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+    args:
+      AIRFLOW_VERSION: ${AIRFLOW_VERSION:-3.3.2}
+  image: ${AIRFLOW_IMAGE_NAME:-airflow-roi:latest}
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-change-me-airflow-jwt-secret}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__API__BASE_URL: ${AIRFLOW_PUBLIC_URL:-http://localhost:8080}
+    AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+    # roi_pipeline is bind-mounted below (and also baked into the image).
+    PYTHONPATH: /opt/airflow
+    ROI_DATA_ROOT: /data
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/roi_pipeline:/opt/airflow/roi_pipeline
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    mem_limit: ${POSTGRES_MEM_LIMIT:-1g}
+
+  redis:
+    image: redis:7.2-bookworm
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+    mem_limit: ${REDIS_MEM_LIMIT:-512m}
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    mem_limit: ${AIRFLOW_SERVICE_MEM_LIMIT:-2g}
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    mem_limit: ${AIRFLOW_SERVICE_MEM_LIMIT:-2g}
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    mem_limit: ${AIRFLOW_SERVICE_MEM_LIMIT:-2g}
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    mem_limit: ${AIRFLOW_SERVICE_MEM_LIMIT:-2g}
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # The node that "hosts the data": the only service with the raw datasets
+  # mounted, and the only Celery worker listening on the `data` queue. Every
+  # task that must touch the movie (factorization, ROI traces) is pinned to
+  # that queue. Its cgroup memory cap is DATA_NODE_MEM_LIMIT; memswap_limit is
+  # set to the same value so the cap cannot be dodged by swapping.
+  data-node:
+    <<: *airflow-common
+    command: celery worker --queues data
+    hostname: data-node
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+      AIRFLOW__CELERY__WORKER_CONCURRENCY: ${DATA_NODE_CONCURRENCY:-1}
+      ROI_NODE_ROLE: data
+      OMP_NUM_THREADS: ${DATA_NODE_THREADS:-4}
+      OPENBLAS_NUM_THREADS: ${DATA_NODE_THREADS:-4}
+      MKL_NUM_THREADS: ${DATA_NODE_THREADS:-4}
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+      - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+      - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+      - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+      - ${AIRFLOW_PROJ_DIR:-.}/roi_pipeline:/opt/airflow/roi_pipeline
+      - ${DATASETS_DIR:-./data/datasets}:/data/datasets
+      - ${RESULTS_DIR:-./data/results}:/data/results
+      - ${MODELS_DIR:-./data/models}:/data/models:ro
+    mem_limit: ${DATA_NODE_MEM_LIMIT:-8g}
+    memswap_limit: ${DATA_NODE_MEM_LIMIT:-8g}
+    cpus: ${DATA_NODE_CPUS:-4}
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-apiserver:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Interchangeable compute workers on the `default` queue. They see results
+  # (and optional trained classifiers) but not the raw datasets, which keeps
+  # the "data lives on one node" constraint honest. Scale with
+  # COMPUTE_WORKER_REPLICAS or `docker compose up -d --scale compute-worker=4`.
+  compute-worker:
+    <<: *airflow-common
+    command: celery worker --queues default
+    deploy:
+      replicas: ${COMPUTE_WORKER_REPLICAS:-2}
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+      AIRFLOW__CELERY__WORKER_CONCURRENCY: ${COMPUTE_WORKER_CONCURRENCY:-2}
+      ROI_NODE_ROLE: compute
+      OMP_NUM_THREADS: ${COMPUTE_WORKER_THREADS:-2}
+      OPENBLAS_NUM_THREADS: ${COMPUTE_WORKER_THREADS:-2}
+      MKL_NUM_THREADS: ${COMPUTE_WORKER_THREADS:-2}
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+      - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+      - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+      - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+      - ${AIRFLOW_PROJ_DIR:-.}/roi_pipeline:/opt/airflow/roi_pipeline
+      - ${RESULTS_DIR:-./data/results}:/data/results
+      - ${MODELS_DIR:-./data/models}:/data/models:ro
+    mem_limit: ${COMPUTE_WORKER_MEM_LIMIT:-3g}
+    memswap_limit: ${COMPUTE_WORKER_MEM_LIMIT:-3g}
+    cpus: ${COMPUTE_WORKER_CPUS:-2}
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-apiserver:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo -e "\033[1;33mWARNING: AIRFLOW_UID not set; run 'make env' so files are owned by you, not root.\e[0m"
+          export AIRFLOW_UID=$$(id -u)
+        fi
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config}
+        /entrypoint airflow version
+        /entrypoint airflow config list >/dev/null
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,plugins,config}
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+
+  # Celery-level view of the workers: `docker compose --profile flower up -d`.
+  flower:
+    <<: *airflow-common
+    command: celery flower
+    profiles:
+      - flower
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    mem_limit: ${AIRFLOW_SERVICE_MEM_LIMIT:-2g}
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Monitoring site: node status (via the Docker socket), dataset browser,
+  # result viewer and a launcher that triggers DAG runs through the Airflow API.
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/dashboard/Dockerfile
+    image: ${DASHBOARD_IMAGE_NAME:-roi-dashboard:latest}
+    ports:
+      - "${DASHBOARD_PORT:-8090}:8090"
+    environment:
+      AIRFLOW_API_URL: http://airflow-apiserver:8080
+      AIRFLOW_PUBLIC_URL: ${AIRFLOW_PUBLIC_URL:-http://localhost:8080}
+      FLOWER_PUBLIC_URL: ${FLOWER_PUBLIC_URL:-http://localhost:5555}
+      AIRFLOW_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      AIRFLOW_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      ROI_DATA_ROOT: /data
+      DATA_NODE_MEM_LIMIT: ${DATA_NODE_MEM_LIMIT:-8g}
+      NODE_POLL_SECONDS: ${NODE_POLL_SECONDS:-5}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${DATASETS_DIR:-./data/datasets}:/data/datasets:ro
+      - ${RESULTS_DIR:-./data/results}:/data/results:ro
+      - ${AIRFLOW_PROJ_DIR:-.}/dashboard:/app/dashboard
+      - ${AIRFLOW_PROJ_DIR:-.}/roi_pipeline:/app/roi_pipeline
+    mem_limit: ${DASHBOARD_MEM_LIMIT:-1g}
+    restart: always
+    depends_on:
+      airflow-apiserver:
+        condition: service_healthy
+
+volumes:
+  postgres-db-volume:

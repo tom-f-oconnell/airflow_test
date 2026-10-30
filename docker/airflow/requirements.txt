@@ -1,0 +1,6 @@
+numpy>=1.26
+scipy>=1.11
+scikit-learn>=1.4
+zarr>=3.0
+tifffile>=2024.1
+pillow>=10

@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} · ROI pipeline console{% endblock %}
+{% block content %}
+<section>
+  <div class="section-head"><h2>{{ name }}</h2><a href="/">← overview</a></div>
+  <dl class="facts">
+    <dt>Shape (T, Z, Y, X)</dt><dd class="num">{{ info.shape|join(" × ") }}</dd>
+    <dt>Storage</dt><dd>{{ info.dtype }}, {{ info.size_bytes|size }} ({{ info.format }})</dd>
+    <dt>Frame rate</dt><dd>{{ info.frame_rate_hz or "unknown" }} Hz</dd>
+    <dt>Stimuli</dt><dd>{% if schedule %}{{ schedule.ids|length }} stimuli, {{ schedule.duration_frames }} frames each,
+      {{ (schedule.onsets.values()|map("length")|sum) }} presentations{% else %}none recorded{% endif %}</dd>
+    {% if n_truth %}<dt>Planted ROIs</dt><dd class="num">{{ n_truth }}</dd>{% endif %}
+  </dl>
+  <figure>
+    <img src="/api/datasets/{{ name }}/preview.png" alt="max projection montage of {{ name }}" loading="lazy">
+    <figcaption>Max projection over a subsample of frames, one tile per Z plane.</figcaption>
+  </figure>
+  <form method="post" action="/launch" class="inline-form">
+    <input type="hidden" name="dag_id" value="roi_factorization">
+    <input type="hidden" name="dataset" value="{{ name }}">
+    <label>method <select name="method"><option>nmf</option><option>pca_ica</option></select></label>
+    <label>k <input type="number" name="n_components" value="20" min="1"></label>
+    <label>memory <select name="memory_mode"><option>auto</option><option>in_memory</option><option>chunked</option></select></label>
+    <label>downsample <input type="number" name="spatial_downsample" value="1" min="1"></label>
+    <button type="submit">Run factorization</button>
+  </form>
+</section>
+
+<section class="two-col">
+  <div>
+    <h3>Runs</h3>
+    {% if results %}
+    <ul class="runs">
+      {% for r in results %}
+        {% set s = r.summary %}
+        <li class="{{ 'selected' if detail and r.run == detail.run else '' }}">
+          <a href="/datasets/{{ name }}?run={{ r.run }}" class="mono">{{ r.run }}</a>
+          <span class="badge state-{{ s.state if s else 'running' }}">{{ s.state if s else "incomplete" }}</span>
+          {% if r.plan %}<small>{{ r.plan.params.method }} · {{ r.plan.memory.mode }}</small>{% endif %}
+          {% if s %}<small>{{ s.n_rois }} ROIs{% if s.ground_truth %}, recall {{ "%.0f"|format(s.ground_truth.recall * 100) }}%{% endif %}</small>{% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+    {% else %}<p class="muted">No runs for this dataset yet.</p>{% endif %}
+  </div>
+
+  {% if detail %}
+  <div>
+    <h3>Run <span class="mono">{{ detail.run }}</span> <span class="badge state-{{ detail.state }}">{{ detail.state }}</span></h3>
+    {% set plan = detail.plan %}
+    {% set fact = detail.factorization %}
+    {% set cls = detail.classification %}
+    {% set summ = detail.summary %}
+    <dl class="facts">
+      {% if plan %}
+        <dt>Node</dt><dd>{{ plan.node.hostname }} ({{ plan.node.role }})</dd>
+        <dt>Memory cap</dt><dd>{{ plan.memory.cap_bytes|size }} ({{ "cgroup" if plan.memory.cgroup_limited else "host" }})</dd>
+        <dt>Data matrix</dt><dd>{{ plan.memory.n_frames }} × {{ plan.memory.n_voxels }} = {{ plan.memory.matrix_bytes|size }}</dd>
+        <dt>Estimate</dt><dd>in-memory {{ plan.memory.in_memory_estimate|size }}{{ " ✓" if plan.memory.fits_in_memory else " ✗" }},
+          chunked {{ plan.memory.chunked_estimate|size }} → <strong>{{ plan.memory.mode }}</strong>
+          (requested {{ plan.memory.requested_mode }})</dd>
+      {% endif %}
+      {% if fact %}
+        <dt>Factorization</dt><dd>{{ fact.method }}, k={{ fact.n_components }}, downsample {{ fact.downsample }},
+          {{ "%.1f"|format(fact.stats.seconds) }} s, peak RSS {{ fact.stats.peak_rss_bytes|size }}</dd>
+      {% endif %}
+      {% if detail.rois %}<dt>ROIs</dt><dd class="num">{{ detail.rois.rois|length }}</dd>{% endif %}
+      {% if cls %}
+        <dt>Quality ({{ cls.quality_source }})</dt><dd>{% for k, v in cls.quality_counts.items() %}{{ k }} {{ v }}{{ ", " if not loop.last }}{% endfor %}</dd>
+        {% if cls.stimuli %}<dt>Responsive</dt><dd>{{ cls.stimuli.n_responsive }} of {{ cls.rois|length }} (z &gt; {{ cls.stimuli.z_threshold }}), grouped by {{ cls.grouping }}</dd>{% endif %}
+      {% endif %}
+      {% if summ and summ.ground_truth %}
+        <dt>Ground truth</dt><dd>{{ summ.ground_truth.recovered }} of {{ summ.ground_truth.n_planted }} planted ROIs recovered
+          ({{ "%.0f"|format(summ.ground_truth.recall * 100) }}% recall)</dd>
+      {% endif %}
+    </dl>
+    <p class="muted">Raw:
+      {% for f in ["plan", "factorization", "rois", "classification", "summary"] %}
+        {% if detail[f] %}<a href="/api/results/{{ name }}/{{ detail.run }}/{{ f }}.json">{{ f }}.json</a>{{ " · " if not loop.last }}{% endif %}
+      {% endfor %}
+    </p>
+
+    {% if detail.rois %}
+    <figure>
+      <img src="/api/results/{{ name }}/{{ detail.run }}/overlay.png" alt="ROI overlay for run {{ detail.run }}" loading="lazy">
+      <figcaption>ROIs tinted over the max projection (colour cycles through 8 slots; the id in the table identifies an ROI).</figcaption>
+    </figure>
+
+    <div class="chart" id="trace-chart" data-url="/api/results/{{ name }}/{{ detail.run }}/traces.json">
+      <div class="section-head"><h4>ROI traces (dF/F)</h4><span class="muted">tick ROIs in the table; hover for values</span></div>
+      <svg id="trace-svg" width="100%" height="260" role="img" aria-label="dF/F traces of selected ROIs"></svg>
+      <div id="trace-legend" class="legend"></div>
+      <div id="trace-tooltip" class="tooltip" hidden></div>
+    </div>
+
+    <table class="grid roi-table" id="roi-table">
+      <thead><tr><th></th><th>ROI</th><th>Comp.</th><th>Voxels</th><th>Centroid (z, y, x)</th><th>Quality</th><th>SNR</th><th>Skew</th><th>Responsive to</th><th>Class</th></tr></thead>
+      <tbody>
+      {% for r in detail.roi_rows %}
+        <tr>
+          <td><input type="checkbox" class="roi-pick" value="{{ r.id }}" {% if loop.index <= 6 %}checked{% endif %} aria-label="plot ROI {{ r.id }}"></td>
+          <td class="num"><span class="swatch" data-roi="{{ r.id }}"></span>{{ r.id }}</td>
+          <td class="num">{{ r.component }}</td>
+          <td class="num">{{ r.n_voxels }}</td>
+          <td class="num">{{ r.centroid|map("round", 1)|join(", ") }}</td>
+          <td>{% if r.quality %}<span class="badge q-{{ r.quality.label }}">{{ r.quality.label }} {{ "%.2f"|format(r.quality.score) }}</span>{% endif %}</td>
+          <td class="num">{{ "%.1f"|format(r.features.snr) if r.features else "" }}</td>
+          <td class="num">{{ "%.2f"|format(r.features.skewness) if r.features else "" }}</td>
+          <td>{{ r.responsive_stimuli|join(", ") if r.responsive_stimuli else ("–" if r.responsive_stimuli is not none else "") }}</td>
+          <td class="num">{{ r.response_class if r.response_class is not none and r.response_class >= 0 else "" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+  {% endif %}
+</section>
+{% endblock %}
+{% block scripts %}
+<script>if (document.getElementById("trace-chart")) initTraceChart();</script>
+{% endblock %}
